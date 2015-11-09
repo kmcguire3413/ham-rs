@@ -1,0 +1,41 @@
+///! A container object for holding output such as that from
+///! an Fourier Transformation over time.
+use std;
+
+pub struct SignalMap {
+    ///! Bitmap as a vector.
+    pub v:      Vec<f64>,
+    ///! The width of a row in the bitmap.
+    ///! _This for an FFT is the frequency axis._
+    pub w:      usize,
+    ///! The number of rows in the bitmap.
+    ///! _This for an FFT is the time axis._
+    pub h:      usize,
+}
+
+impl SignalMap {
+    ///! Normalize the values by converting them all to the
+    ///! range of 0.0 to 1.0 with out any intentional loss
+    ///! of precision.
+    fn normalize(&mut self) -> (f64, f64) {
+        let mut min = std::f64::MAX;
+        let mut max = std::f64::MIN;
+        
+        for x in 0..self.v.len() {
+            if self.v[x] < min {
+                min = self.v[x];
+            }
+            if self.v[x] > max {
+                max = self.v[x];
+            }
+        }
+        
+        let rng = max - min;
+        
+        for x in 0..self.v.len() {
+            self.v[x] = (self.v[x] - min) / rng;
+        }
+        
+        (max, min)
+    }
+}
