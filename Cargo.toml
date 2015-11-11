@@ -1,0 +1,13 @@
+[package]
+name = "rsutil"
+version = "0.1.0"
+authors = ["Leonard Kevin McGuire Jr. <kmcg3413@gmail.com>"]
+
+[dependencies.lodepng]
+git = "https://github.com/pornel/lodepng-rust.git"
+[dependencies.num]
+[dependencies.time]
+[dependencies.alsa]
+git = "https://github.com/diwic/alsa-rs.git"
+[dependencies]
+byteorder = "0.3"

@@ -5,6 +5,7 @@ extern crate lodepng;
 extern crate byteorder;
 extern crate alsa;
 extern crate num;
+extern crate time;
 
 use std::cmp::Ordering;
 use std::io::{SeekFrom, Seek, Cursor, Read};
@@ -120,11 +121,16 @@ struct FMDemod {
     tapvi:      Vec<f32>,
     tapvq:      Vec<f32>,
     taps:       Vec<f32>,
+    decim:      usize,
+    curslack:   f32,
+    maxphase:   f32,
+    slack:      f32,
+    audiodecim: usize,
 }
 
 impl FMDemod {
-    pub fn new(sps: f64, offset: f64, bw: f32, taps: Vec<f32>) -> FMDemod {
-        let ifs = buildsine(-240000.0, 4000000.0, 5.0).unwrap();
+    pub fn new(sps: f64, decim: usize, offset: f64, bw: f32, taps: Vec<f32>) -> FMDemod {
+        let ifs = buildsine(offset, sps, 5.0).unwrap();
         
         let mut tapvi: Vec<f32> = Vec::new();
         let mut tapvq: Vec<f32> = Vec::new();
@@ -133,8 +139,24 @@ impl FMDemod {
             tapvi.push(0.0);
             tapvq.push(0.0);
         }
+
+        // If the decimation is not set perfectly then we will have
+        // a fractional part and we need to insert some padding when
+        // it reaches a value representing a whole output sample.
+        let actual_audio_decim = (sps / (decim as f64) / 16000.0) as f32;
+        // Make sure that slack is not >= 1.0 
+        let slack = actual_audio_decim.fract();        
+        let pract_audio_decim = actual_audio_decim.ceil() as usize;
+        let fmaxphaserot = ((std::f64::consts::PI * 2.0f64) / (sps / (decim as f64))) * bw as f64;
+        
+        println!("slack:{} pract_audio_decim:{} decim:{} actual_audio_decim:{}",
+            slack, pract_audio_decim, decim, actual_audio_decim
+        );        
             
     	FMDemod { 
+    	   maxphase:   fmaxphaserot as f32,
+    	   audiodecim: pract_audio_decim,
+    	   slack:      slack,
     	   sps:        sps, 
     	   offset:     offset, 
     	   bw:         bw, 
@@ -149,14 +171,14 @@ impl FMDemod {
     	   tapvi:      tapvi,
     	   tapvq:      tapvq,
     	   taps:       taps,
+    	   decim:      decim,
+    	   curslack:   0.0,
     	}
     }
     
     pub fn work(&mut self, stream: &Vec<Complex<f32>>) -> Vec<f32> {
-        let mut buf: Vec<f32> = Vec::with_capacity(stream.len() / 5 / 50); 
-        
-        let fmaxphaserot = ((std::f32::consts::PI * 2.0) / (4000000.0 / 5.0)) * self.bw;   
-    
+        let mut buf: Vec<f32> = Vec::with_capacity(stream.len() / self.decim / self.audiodecim); 
+            
         for x in 0..stream.len() {
             let mut s = stream[x].clone();            
                         
@@ -166,15 +188,19 @@ impl FMDemod {
                 0
             } else {
                 self.ifsndx + 1
-            };   
+            };               
 
-            if self.q0 == 5 {
+            if self.q0 == self.decim {
                 self.q0 = 0;
-                
-                // tapvi[tapi]  19
-                // tapvq[tapi]  19
-                // taps
-                
+
+                if self.curslack >= 1.0 {
+                    // Hopefully, the slack is < 1.0
+                    self.curslack = self.curslack.fract();
+                    self.li = s.i;
+                    self.lq = s.q;
+                    continue;
+                }                 
+                                
                 self.tapvi[self.tapi as usize] = s.i;
                 self.tapvq[self.tapi as usize] = s.q;
                 
@@ -191,19 +217,13 @@ impl FMDemod {
                 if self.tapi >= self.taps.len() {
                     self.tapi = 0;
                 }        
-                        
                 
                 s.i = si;   
-                s.q = sq;                
-                        
-                //let pwr = (s.i * s.i + s.q * s.q).sqrt();
+                s.q = sq;
 
                 let mut a = s.i.atan2(s.q);
                 let mut b = self.li.atan2(self.lq);
-                
-                if a < 0.0 { a = std::f32::consts::PI + a + std::f32::consts::PI; }
-                if b < 0.0 { b = std::f32::consts::PI + b + std::f32::consts::PI; }        
-                
+                                
                 let mut r = 0f32;
                 
                 r = a - b;
@@ -211,29 +231,24 @@ impl FMDemod {
                 if r > std::f32::consts::PI {
                     r = std::f32::consts::PI * 2.0 + r;
                 }                
-                
-                //if b > a {
-                //    if b - a > std::f32::consts::PI {
-                //        r = ((a + std::f32::consts::PI * 2.0) - b);                       
-                //    } else {
-                //        r = (a - b);
-                //    }
-                //} else {
-                //    r = (a - b);
-                //}     
-                
+                                
                 // This limits sharp impulses where spikes have slipped
                 // through our taps filter.
-                if r.abs() < fmaxphaserot {
+                if r.abs() < self.maxphase {
                     self.rsum += r;
                 }  
                 
                 self.q1 += 1; 
-                if self.q1 == 50 {
+                if self.q1 == self.audiodecim {
                     self.q1 = 0;
                     
-                    self.rsum /= 50f32;
-                                        
+                    // Track how much we are off on the audio output
+                    // due to decimation of the input stream by a value
+                    // that causes our audio decimation to have a fractional
+                    // part.
+                    self.curslack += self.slack;
+                    
+                    self.rsum /= self.audiodecim as f32;            
                     buf.push(self.rsum);
                     
                     self.rsum = 0f32;                    
@@ -327,9 +342,9 @@ fn main() {
     //fn buildsine(freq: f32, sps: f32, amp: f32) -> Option<Vec<Complex<f32>>> {
 
     
-    let taps: Vec<f32> = vec![0.39760953187942505f32, 0.22784264385700226, -1.549405637309571e-16, -0.25822165608406067, -0.5112122297286987, -0.7193102836608887, -0.8434571623802185, -0.8500939607620239, -0.7156971096992493, -0.43036943674087524, 1.549405637309571e-16, 0.5533321499824524, 1.19282865524292, 1.8702067136764526, 2.5303714275360107, 3.117011308670044, 3.5784854888916016, 3.8733248710632324, 3.974698305130005, 3.8733248710632324, 3.5784854888916016, 3.117011308670044, 2.5303714275360107, 1.8702067136764526, 1.19282865524292, 0.5533321499824524, 1.549405637309571e-16, -0.43036943674087524, -0.7156971096992493, -0.8500939607620239, -0.8434571623802185, -0.7193102836608887, -0.5112122297286987, -0.25822165608406067, -1.549405637309571e-16, 0.22784264385700226, 0.39760953187942505];
+    let taps: Vec<f32> = vec![0.44378024339675903f32, 0.9566655158996582, 1.4999324083328247, 2.0293939113616943, 2.499887466430664, 2.8699963092803955, 3.106461763381958, 3.1877646446228027, 3.106461763381958, 2.8699963092803955, 2.499887466430664, 2.0293939113616943, 1.4999324083328247, 0.9566655158996582, 0.44378024339675903];
     
-    let mut fmdemod = FMDemod::new(4000000.0, -240000.0, 30000.0, taps);
+    let mut fmdemod = FMDemod::new(4000000.0, 11, -840000.0, 15000.0, taps);
 
     println!("processing");
     
@@ -354,7 +369,9 @@ fn main() {
             ibuf.push(Complex { i: i, q: q });
         }
         println!("decoding block");
+        let st = time::precise_time_ns();
         let mut out = fmdemod.work(&ibuf);
+        println!("done {}", (time::precise_time_ns() - st) as f64 / 1000.0 / 1000.0 / 1000.0);
         buf.append(&mut out);            
         println!("wavbuf:{}", buf.len());
         fbuf = rdr.into_inner();
