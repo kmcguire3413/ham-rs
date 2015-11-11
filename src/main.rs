@@ -4,20 +4,252 @@
 extern crate lodepng;
 extern crate byteorder;
 extern crate alsa;
+extern crate num;
 
 use std::cmp::Ordering;
-use std::io::{SeekFrom, Seek};
+use std::io::{SeekFrom, Seek, Cursor, Read};
 use std::path::{Path};
 use std::fs::{File, PathExt};
-use byteorder::{ReadBytesExt, LittleEndian};
+use byteorder::{ReadBytesExt, WriteBytesExt, LittleEndian};
+use std::mem;
+use std::str::FromStr;
+use std::thread;
 
 mod algos;
 mod dsp;
 
-use dsp::DSPBlockConvertSpec;
-
 use algos::SignalMap;
 use algos::mcguire_smde;
+
+use dsp::Complex;
+
+#[inline]
+fn u16tou8ale(v: u16) -> [u8; 2] {
+    [
+        v as u8,
+        (v >> 8) as u8,
+    ]
+}
+
+// little endian
+#[inline]
+fn u32tou8ale(v: u32) -> [u8; 4] {
+    [
+        v as u8,
+        (v >> 8) as u8,
+        (v >> 16) as u8,
+        (v >> 24) as u8,
+    ]
+}
+
+fn wavei8write(path: String, sps: u32, buf: &Vec<f32>) {
+    use std::fs::File;
+    use std::io::Write;
+    
+    let datatotalsize = buf.len() as u32 * 4;
+    
+    let mut fd = File::create(path).unwrap();
+    fd.write("RIFF".as_bytes());                                                    // 4
+    fd.write(&u32tou8ale((datatotalsize + 44) - 8)); // filesize - 8                // 4
+    fd.write("WAVE".as_bytes());       //                                           // 4
+    fd.write("fmt ".as_bytes());       // <format marker>                           // 4
+    fd.write(&u32tou8ale(16));         // <format data length>                      // 4
+    fd.write(&u16tou8ale(3));          // PCM                                       // 2
+    fd.write(&u16tou8ale(1));          // 1 channel                                 // 2
+    fd.write(&u32tou8ale(sps));        // sample frequency/rate                     // 4
+    fd.write(&u32tou8ale(sps * 4));    // sps * bitsize * channels / 8 (byte rate)  // 4
+    fd.write(&u16tou8ale(4));          // bitsize * channels / 8  (block-align)     // 2
+    fd.write(&u16tou8ale(32));         // bits per sample                           // 2
+    fd.write("data".as_bytes());       // <data marker>                             // 4
+    fd.write(&u32tou8ale(datatotalsize));  // datasize = filesize - 44              // 4
+
+    for x in 0..buf.len() {
+        fd.write_f32::<LittleEndian>(buf[x]);
+    }
+    
+    //unsafe { 
+    //    let tmp = mem::transmute::<&Vec<i8>, &Vec<u8>>(buf);    
+    //    fd.write(tmp.as_slice());
+    //}
+}
+
+fn buildsine(freq: f64, sps: f64, amp: f32) -> Option<Vec<Complex<f32>>> {
+    if freq * 4.0 > sps {
+        return Option::None;
+    }
+    
+    // How many of our smallest units of time represented
+    // by a sample do we need for a full cycle of the
+    // frequency.
+    let timepersample = 1.0f64 / sps as f64;
+    let units = ((1.0 / freq).abs() / timepersample).ceil() as usize;
+    
+    println!("timepersample:{} freqfullwave:{}", 
+        timepersample,
+        1.0 / freq
+    );
+    
+    let mut out: Vec<Complex<f32>> = Vec::new();
+
+    println!("units:{}", units);
+    
+    for x in 0..units * 100 {
+        let curtime = (x as f64) * timepersample;
+        out.push(Complex {
+            i:  (curtime * freq * std::f64::consts::PI * 2.0).cos() as f32 * amp,
+            q:  (curtime * freq * std::f64::consts::PI * 2.0).sin() as f32 * amp,
+        });
+    }
+    
+    Option::Some(out)
+}
+
+
+struct FMDemod {
+    sps:        f64,
+    offset:     f64,
+    bw:         f32,
+    q0:         usize,
+    q1:         usize,
+    li:         f32,
+    lq:         f32,
+    ifs:        Vec<Complex<f32>>,
+    ifsndx:     usize,
+    rsum:       f32,
+    tapi:       usize,
+    tapvi:      Vec<f32>,
+    tapvq:      Vec<f32>,
+    taps:       Vec<f32>,
+}
+
+impl FMDemod {
+    pub fn new(sps: f64, offset: f64, bw: f32, taps: Vec<f32>) -> FMDemod {
+        let ifs = buildsine(-240000.0, 4000000.0, 5.0).unwrap();
+        
+        let mut tapvi: Vec<f32> = Vec::new();
+        let mut tapvq: Vec<f32> = Vec::new();
+        
+        for x in 0..taps.len() {
+            tapvi.push(0.0);
+            tapvq.push(0.0);
+        }
+            
+    	FMDemod { 
+    	   sps:        sps, 
+    	   offset:     offset, 
+    	   bw:         bw, 
+    	   li:         0.0, 
+    	   lq:         0.0,
+    	   q0:         0,
+    	   q1:         0,
+    	   ifs:        ifs,
+    	   ifsndx:     0,
+    	   rsum:       0.0,
+    	   tapi:       0,
+    	   tapvi:      tapvi,
+    	   tapvq:      tapvq,
+    	   taps:       taps,
+    	}
+    }
+    
+    pub fn work(&mut self, stream: &Vec<Complex<f32>>) -> Vec<f32> {
+        let mut buf: Vec<f32> = Vec::with_capacity(stream.len() / 5 / 50); 
+        
+        let fmaxphaserot = ((std::f32::consts::PI * 2.0) / (4000000.0 / 5.0)) * self.bw;   
+    
+        for x in 0..stream.len() {
+            let mut s = stream[x].clone();            
+                        
+            s.mul(&self.ifs[self.ifsndx]);
+            
+            self.ifsndx = if self.ifsndx + 1 >= self.ifs.len() {
+                0
+            } else {
+                self.ifsndx + 1
+            };   
+
+            if self.q0 == 5 {
+                self.q0 = 0;
+                
+                // tapvi[tapi]  19
+                // tapvq[tapi]  19
+                // taps
+                
+                self.tapvi[self.tapi as usize] = s.i;
+                self.tapvq[self.tapi as usize] = s.q;
+                
+                let mut si = 0.0f32;
+                let mut sq = 0.0f32;
+                
+                for ti in 0..self.taps.len() {
+                    let off = if (ti > self.tapi) { self.taps.len() - (ti - self.tapi)} else { self.tapi - ti };
+                    si += self.tapvi[off] * self.taps[ti];
+                    sq += self.tapvq[off] * self.taps[ti];
+                }
+                
+                self.tapi += 1;
+                if self.tapi >= self.taps.len() {
+                    self.tapi = 0;
+                }        
+                        
+                
+                s.i = si;   
+                s.q = sq;                
+                        
+                //let pwr = (s.i * s.i + s.q * s.q).sqrt();
+
+                let mut a = s.i.atan2(s.q);
+                let mut b = self.li.atan2(self.lq);
+                
+                if a < 0.0 { a = std::f32::consts::PI + a + std::f32::consts::PI; }
+                if b < 0.0 { b = std::f32::consts::PI + b + std::f32::consts::PI; }        
+                
+                let mut r = 0f32;
+                
+                r = a - b;
+                
+                if r > std::f32::consts::PI {
+                    r = std::f32::consts::PI * 2.0 + r;
+                }                
+                
+                //if b > a {
+                //    if b - a > std::f32::consts::PI {
+                //        r = ((a + std::f32::consts::PI * 2.0) - b);                       
+                //    } else {
+                //        r = (a - b);
+                //    }
+                //} else {
+                //    r = (a - b);
+                //}     
+                
+                // This limits sharp impulses where spikes have slipped
+                // through our taps filter.
+                if r.abs() < fmaxphaserot {
+                    self.rsum += r;
+                }  
+                
+                self.q1 += 1; 
+                if self.q1 == 50 {
+                    self.q1 = 0;
+                    
+                    self.rsum /= 50f32;
+                                        
+                    buf.push(self.rsum);
+                    
+                    self.rsum = 0f32;                    
+                } 
+            }
+             
+            self.li = s.i;
+            self.lq = s.q;   
+        
+            self.q0 += 1;
+        }    
+        
+        // Return the buffer containing the demodulated data.
+        buf
+    }
+}
 
 fn main() {
     /*
@@ -52,6 +284,7 @@ fn main() {
     
     if true { return; }    
     */
+    
     //other();
 
     //if true {
@@ -65,88 +298,69 @@ fn main() {
         Err(_) => panic!("Could not get file length."),
     };
     
-    let mut fp = File::open(fpath).unwrap();
-    
-    let mut lpf = dsp::DSPBlockLowPass::new(1f64);
-    let mut lpf_split = dsp::DSPBlockSplitter::new();
-    let mut audio = dsp::DSPBlockSinkAudio::new(16000);
-    let mut conv = dsp::DSPBlockConvert::new(25);
-    let mut fm = dsp::DSPBlockFMDecode::new();
-    let mut fm_split = dsp::DSPBlockSplitter::new();
-    
-    let mut bf0: dsp::DSPBlockSinkFile<dsp::Complex<f64>> = dsp::DSPBlockSinkFile::new(Path::new("/home/kmcguire/Projects/radiowork/usbstore/lpfout"));
-    let mut bf1: dsp::DSPBlockSinkFile<f64> = dsp::DSPBlockSinkFile::new(Path::new("/home/kmcguire/Projects/radiowork/usbstore/fmout"));
-    
-    let (chan_begin, lpf_in) = dsp::dspchan_create();
-    
-    let (lpf_out, lpf_split_in) = dsp::dspchan_create();
-    let (lpf_split_out0, fm_in) = dsp::dspchan_create();
-    let (lpf_split_out1, bf0_in) = dsp::dspchan_create();    
-    
-    let (fm_out, fm_split_in) = dsp::dspchan_create();
-    let (fm_split_out0, conv_in) = dsp::dspchan_create();
-    let (fm_split_out1, bf1_in) = dsp::dspchan_create();
-    
-    let (conv_out, audio_in) = dsp::dspchan_create();
-    
-    
-    lpf.set_input(lpf_in);
-    lpf.set_output(lpf_out);
-    
-    lpf_split.set_input(lpf_split_in);
-    lpf_split.add_output(lpf_split_out0);
-    lpf_split.add_output(lpf_split_out1);
-    
-    bf0.set_input(bf0_in);
-    bf1.set_input(bf1_in);
-    
-    fm.set_input(fm_in);
-    fm.set_output(fm_out);
-    
-    fm_split.set_input(fm_split_in);
-    fm_split.add_output(fm_split_out0);
-    fm_split.add_output(fm_split_out1);
-    
-    conv.set_input(conv_in);
-    conv.set_output(conv_out);
-    
-    audio.set_input(audio_in);
+    let mut fp = File::open(fpath).unwrap();    
 
-    let mut sent = 0;    
+    fp.seek(SeekFrom::Start(0)).unwrap();
+
+    let mut q0 = 0; 
+    let mut q1 = 0;
+    let mut fmlast_i = 0f32;
+    let mut fmlast_q = 0f32;
     
-    /*for x in 0..fsize / 8 / 10 {
-        fp.seek(SeekFrom::Start((x * 10 * 8) as u64)).unwrap();
-        
-        let i = fp.read_f32::<LittleEndian>().unwrap() as f64;
-        let q = fp.read_f32::<LittleEndian>().unwrap() as f64;
-    */
+    let mut buf: Vec<f32> = Vec::new();
     
-    for x in 0..1024 * 1024 * 100 {
-        let i = 30000.0 * (x as f64 * 0.1 * 3.141).sin();
-        let q = 0.0 * (x as f64 * 0.1 * 3.141).sin();
+    let bufsubsize = 1024 * 1024 * 290;     
+
+    let mut fbuf: Vec<u8> = Vec::with_capacity(bufsubsize);
     
-        chan_begin.send(dsp::Complex { i: i, q: q });
-        sent += 1;
-        if sent > 1024 * 1024 * 4 {
-            use dsp::DSPBlockSinkFileSpec;
-            
-            println!("block A processing");
-            lpf.tick_uoi();
-            lpf_split.tick_uoi();
-            bf0.tick_uoi();
-            println!("block B processing");
-            fm.tick_uoi();
-            fm_split.tick_uoi();
-            bf1.tick_uoi();
-            println!("block C processing");
-            conv.tick_uoi();
-            println!("block D processing");
-            audio.tick_uoi();
-            println!("audio sent {}", audio.get_consumed());
-            sent = 0;
-            println!("sending data to block");
+    unsafe {
+        fbuf.set_len(bufsubsize);
+    }       
+    
+    let mut rsum = 0f32;
+    
+    let mut lr = 0f32;
+    
+    let mut pwr_min = std::f32::MAX;
+    let mut pwr_max = std::f32::MIN;
+    
+    //fn buildsine(freq: f32, sps: f32, amp: f32) -> Option<Vec<Complex<f32>>> {
+
+    
+    let taps: Vec<f32> = vec![0.39760953187942505f32, 0.22784264385700226, -1.549405637309571e-16, -0.25822165608406067, -0.5112122297286987, -0.7193102836608887, -0.8434571623802185, -0.8500939607620239, -0.7156971096992493, -0.43036943674087524, 1.549405637309571e-16, 0.5533321499824524, 1.19282865524292, 1.8702067136764526, 2.5303714275360107, 3.117011308670044, 3.5784854888916016, 3.8733248710632324, 3.974698305130005, 3.8733248710632324, 3.5784854888916016, 3.117011308670044, 2.5303714275360107, 1.8702067136764526, 1.19282865524292, 0.5533321499824524, 1.549405637309571e-16, -0.43036943674087524, -0.7156971096992493, -0.8500939607620239, -0.8434571623802185, -0.7193102836608887, -0.5112122297286987, -0.25822165608406067, -1.549405637309571e-16, 0.22784264385700226, 0.39760953187942505];
+    
+    let mut fmdemod = FMDemod::new(4000000.0, -240000.0, 30000.0, taps);
+
+    println!("processing");
+    
+    let mut buf: Vec<f32> = Vec::new();
+    let mut ibuf: Vec<Complex<f32>> = Vec::with_capacity(fbuf.len() / 8);    
+    
+    for x in 0..fsize / bufsubsize {
+        let fbuflen = fp.read(&mut fbuf).unwrap();
+        println!("fbuflen:{}", fbuflen);
+        let mut rdr = Cursor::new(fbuf);
+
+        ibuf.clear();
+        loop {
+            let i = match rdr.read_f32::<LittleEndian>() {
+                Result::Err(_) => break,
+                Result::Ok(v) => v,       
+            };
+            let q = match rdr.read_f32::<LittleEndian>() {
+                Result::Err(_) => break,
+                Result::Ok(v) => v,
+            };
+            ibuf.push(Complex { i: i, q: q });
         }
+        println!("decoding block");
+        let mut out = fmdemod.work(&ibuf);
+        buf.append(&mut out);            
+        println!("wavbuf:{}", buf.len());
+        fbuf = rdr.into_inner();
     } 
+    
+    wavei8write(String::from_str("tmp.wav").unwrap(), 16000, &buf);
     
     println!("done");
 }
