@@ -5,8 +5,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt, LittleEndian};
 
 use std::ffi::CString;
 
-use alsa::{Direction, ValueOr};
-use alsa::pcm::{PCM, HwParams, Format, Access, State};
+use alsa::{PCM, Stream, Mode, Format, Access, Prepared};
 
 use std::collections::VecDeque;
 use std;
@@ -30,39 +29,19 @@ impl<T: num::traits::Float> Complex<T> {
 
 pub struct Alsa {
     sps:            u32,
-    pcm:            PCM,
-    consumed:       usize,
+    pcm:            PCM<Prepared>,
 }
 
 impl Alsa {
     pub fn new(sps: u32) -> Alsa {
-        // Open default playback device
-        let pcm = PCM::open(&*CString::new("default").unwrap(), Direction::Playback, false).unwrap();
-        
-        {
-            let hwp = HwParams::any(&pcm).unwrap();
-            hwp.set_channels(1).unwrap();
-            hwp.set_rate(sps, ValueOr::Nearest).unwrap();
-            hwp.set_format(Format::s16()).unwrap();
-            hwp.set_access(Access::RWInterleaved).unwrap();
-            pcm.hw_params(&hwp).unwrap();
-        }
+        let pcm = PCM::open("default", Stream::Playback, Mode::Blocking).unwrap();
+        let mut pcm = pcm.set_parameters(Format::FloatLE, Access::Interleaved, 1, sps as usize).ok().unwrap();
             
-        Alsa { sps: sps, pcm: pcm, consumed: 0 }
+        Alsa { sps: sps, pcm: pcm }
     }
-    
-    pub fn get_consumed(&self) -> usize {
-        self.consumed
-    }
-    
-    pub fn write(&mut self, buf: &Vec<i16>) {
-        {
-            let io = self.pcm.io_i16().unwrap();
-            self.consumed += buf.len();
-            io.writei(buf);
-        }
-        if self.pcm.state() != State::Running { self.pcm.start().unwrap() };
-        self.pcm.drain().unwrap();
+        
+    pub fn write(&mut self, buf: &Vec<f32>) {
+        self.pcm.write_interleaved(&buf).unwrap();
     }     
 }
 
@@ -117,10 +96,12 @@ pub struct FMDemod {
     maxphase:   f32,
     slack:      f32,
     audiodecim: usize,
+    sq:         usize,
+    devsqlimit: usize,
 }
 
 impl FMDemod {
-    pub fn new(sps: f64, decim: usize, offset: f64, bw: f32, taps: Vec<f32>) -> FMDemod {
+    pub fn new(sps: f64, decim: usize, offset: f64, bw: f32, taps: Vec<f32>, devsqlimit: usize) -> FMDemod {
         let ifs = buildsine(offset, sps, 5.0).unwrap();
         
         let mut tapvi: Vec<f32> = Vec::new();
@@ -145,6 +126,7 @@ impl FMDemod {
         );        
             
     	FMDemod { 
+    	   devsqlimit: devsqlimit,
     	   maxphase:   fmaxphaserot as f32,
     	   audiodecim: pract_audio_decim,
     	   slack:      slack,
@@ -164,6 +146,7 @@ impl FMDemod {
     	   taps:       taps,
     	   decim:      decim,
     	   curslack:   0.0,
+    	   sq:         0,
     	}
     }
     
@@ -227,7 +210,16 @@ impl FMDemod {
                 // through our taps filter.
                 if r.abs() < self.maxphase {
                     self.rsum += r;
-                }  
+                    self.sq -= 1;
+                    if self.sq < 1 {
+                        self.sq = 1;
+                    }
+                } else {
+                    self.sq += 1;
+                    if self.sq > 10 {
+                        self.sq = 30;
+                    }
+                }
                 
                 self.q1 += 1; 
                 if self.q1 == self.audiodecim {
@@ -239,8 +231,12 @@ impl FMDemod {
                     // part.
                     self.curslack += self.slack;
                     
-                    self.rsum /= self.audiodecim as f32;            
-                    buf.push(self.rsum);
+                    self.rsum /= self.audiodecim as f32;
+                    if self.sq > self.devsqlimit {
+                        buf.push(0.0);
+                    } else {      
+                        buf.push(self.rsum / (self.sq as f32));
+                    }
                     
                     self.rsum = 0f32;                    
                 } 
