@@ -1,11 +1,18 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
 #![feature(path_ext)]
 #![feature(convert)]
 #![feature(deque_extras)]
+#![feature(heap_api)]
+#![feature(alloc)]
+#![allow(non_camel_case_types)]
 extern crate lodepng;
 extern crate byteorder;
 extern crate alsa;
 extern crate num;
 extern crate time;
+extern crate libc;
+extern crate alloc;
 
 use std::cmp::Ordering;
 use std::io::{SeekFrom, Seek, Cursor, Read};
@@ -15,7 +22,9 @@ use byteorder::{ReadBytesExt, WriteBytesExt, LittleEndian};
 use std::mem;
 use std::str::FromStr;
 use std::thread;
+use std::ffi::CString;
 
+mod usrp;
 mod algos;
 mod dsp;
 
@@ -266,6 +275,157 @@ impl FMDemod {
     }
 }
 
+struct USRPSource {
+    usrp_handle:        usrp::uhd_usrp_handle,
+    streamer_handle:    usrp::uhd_rx_streamer_handle,
+    metadata_handle:    usrp::uhd_rx_metadata_handle,
+    buff:               *mut Complex<f32>,
+    buffs_ptr:          *mut *mut Complex<f32>,
+    max_num_samps:      usrp::size_t,
+    
+}
+
+impl USRPSource {
+    pub fn new() -> USRPSource {
+    let mut usrp_channel: u64 = 0;
+        unsafe {  
+        
+            let mut usrp_handle: usrp::uhd_usrp_handle = std::mem::zeroed();
+            let mut streamer_handle: usrp::uhd_rx_streamer_handle = std::mem::zeroed();
+            let mut metadata_handle: usrp::uhd_rx_metadata_handle = std::mem::zeroed();
+            let mut tunereq = usrp::uhd_tune_request_t {
+                target_freq:        146000000.0,
+                rf_freq_policy:     usrp::UHD_TUNE_REQUEST_POLICY_AUTO,
+                rf_freq:            0.0,
+                dsp_freq_policy:    usrp::UHD_TUNE_REQUEST_POLICY_AUTO,
+                dsp_freq:           0.0,
+                args:               0 as *mut i8,
+            };
+            let mut streamargs = usrp::uhd_stream_args_t {
+                cpu_format:         CString::new("fc32").unwrap().into_raw(), 
+                otw_format:         CString::new("sc16").unwrap().into_raw(),
+                args:               CString::new("").unwrap().into_raw(),
+                channel_list:       &mut usrp_channel as *mut u64,
+                n_channels:         1,  
+            };
+            
+            let mut streamcmd = usrp::uhd_stream_cmd_t {
+                //stream_mode:         usrp::UHD_STREAM_MODE_NUM_SAMPS_AND_DONE,
+                stream_mode:         usrp::UHD_STREAM_MODE_START_CONTINUOUS,
+                num_samps:           0,
+                stream_now:          1,
+                time_spec_full_secs: 0,
+                time_spec_frac_secs: 0.0,
+            };
+            
+            usrp::uhd_usrp_make(&mut usrp_handle, CString::new("").unwrap().as_ptr());
+            usrp::uhd_rx_streamer_make(&mut streamer_handle);
+            usrp::uhd_rx_metadata_make(&mut metadata_handle);
+            usrp::uhd_usrp_set_rx_rate(usrp_handle, 800000.0, usrp_channel);
+            let mut actual_rx_rate: f64 = 0.0;
+            usrp::uhd_usrp_get_rx_rate(usrp_handle, usrp_channel, &mut actual_rx_rate); 
+            usrp::uhd_usrp_set_rx_gain(usrp_handle, 20.0, usrp_channel, CString::new("").unwrap().as_ptr());
+            
+            //     pub fn uhd_usrp_set_rx_freq(h: uhd_usrp_handle,
+            //                        tune_request: *mut uhd_tune_request_t,
+            //                        chan: size_t,
+            //                        tune_result: *mut uhd_tune_result_t)
+            // -> uhd_error;
+            
+            let mut tuneresult: usrp::uhd_tune_result_t = std::mem::zeroed();
+            
+            usrp::uhd_usrp_set_rx_freq(
+                usrp_handle, 
+                &mut tunereq as *mut usrp::uhd_tune_request_t,
+                usrp_channel,
+                &mut tuneresult as *mut usrp::uhd_tune_result_t
+            );
+            
+            //     pub fn uhd_usrp_get_rx_stream(h: uhd_usrp_handle,
+            //      stream_args: *mut uhd_stream_args_t,
+            //      h_out: uhd_rx_streamer_handle) -> uhd_error;
+            
+            usrp::uhd_usrp_get_rx_stream(
+                usrp_handle, 
+                &mut streamargs as &mut usrp::uhd_stream_args_t,
+                streamer_handle
+            );
+            
+            //     pub fn uhd_rx_streamer_max_num_samps(h: uhd_rx_streamer_handle,
+            //              max_num_samps_out: *mut size_t)
+            
+            let mut max_num_samps: usrp::size_t = 0;
+            
+            usrp::uhd_rx_streamer_max_num_samps(streamer_handle, &mut max_num_samps as *mut usrp::size_t);
+    
+            println!("max_num_samps: {}", max_num_samps);        
+            
+            //     pub fn uhd_rx_streamer_issue_stream_cmd(h: uhd_rx_streamer_handle,
+            //              stream_cmd:
+            //              *const usrp::uhd_stream_cmd_t)
+            
+            usrp::uhd_rx_streamer_issue_stream_cmd(
+                streamer_handle, &streamcmd as *const usrp::uhd_stream_cmd_t
+            );
+            
+            let mut buff: *mut Complex<f32> = alloc::heap::allocate((max_num_samps * 2 * 4) as usize, 4) as *mut Complex<f32>;
+            let mut buffs_ptr: *mut *mut Complex<f32> = &mut buff;
+            
+            // pub fn uhd_rx_streamer_recv(h: uhd_rx_streamer_handle,
+            //                            buffs: *mut *mut ::libc::c_void,
+            //                            samps_per_buff: size_t,
+            //                            md: *mut uhd_rx_metadata_handle,
+            //                            timeout: ::libc::c_double, one_packet: u8,
+            //                            items_recvd: *mut size_t) -> uhd_error;        
+            //
+            
+            USRPSource {
+                usrp_handle:        usrp_handle,
+                streamer_handle:    streamer_handle,
+                metadata_handle:    metadata_handle,  
+                buff:               buff,
+                buffs_ptr:          buffs_ptr,    
+                max_num_samps:      max_num_samps,                          
+            }                        
+        }    
+    }
+    
+    pub fn recv(&mut self) {
+        unsafe {
+            let mut err;
+            
+            println!("usrp trying recv");  
+            
+            let mut num_rx_samps: usrp::size_t = 0;             
+            
+            err = usrp::uhd_rx_streamer_recv(
+                self.streamer_handle,
+                self.buffs_ptr as *mut *mut libc::c_void,
+                self.max_num_samps,
+                &mut self.metadata_handle,
+                3.0,
+                0,
+                &mut num_rx_samps as *mut usrp::size_t
+            );
+    
+            let sbuf: Vec<Complex<f32>> = Vec::from_raw_parts(self.buff, self.max_num_samps as usize * 8, self.max_num_samps as usize * 8);         
+            
+            for x in 0..sbuf.len() {
+                let i = sbuf[x].i;
+                let q = sbuf[x].q;
+                if i == 0.0 && q == 0.0 {
+                    break;
+                }
+                println!("x:{} vector: {},{}", x, i, q);
+            }
+            
+            println!("num_samples: {}", num_rx_samps);
+            
+            println!("usrp done streaming {}", err);
+        }
+    }
+}
+
 fn main() {
     /*
     let fpath: &Path = Path::new("/home/kmcguire/Projects/radiowork/usbstore/test147.840");
@@ -341,6 +501,13 @@ fn main() {
     
     //fn buildsine(freq: f32, sps: f32, amp: f32) -> Option<Vec<Complex<f32>>> {
 
+    // pub fn uhd_usrp_make(h: *mut uhd_usrp_handle, args: *const ::libc::c_char) -> uhd_error;
+    // pub fn uhd_rx_streamer_make(h: *mut uhd_rx_streamer_handle) -> uhd_error;
+    // pub fn uhd_rx_metadata_make(handle: *mut uhd_rx_metadata_handle) -> uhd_error;
+    
+    if true {
+        return;
+    }
     
     let taps: Vec<f32> = vec![0.44378024339675903f32, 0.9566655158996582, 1.4999324083328247, 2.0293939113616943, 2.499887466430664, 2.8699963092803955, 3.106461763381958, 3.1877646446228027, 3.106461763381958, 2.8699963092803955, 2.499887466430664, 2.0293939113616943, 1.4999324083328247, 0.9566655158996582, 0.44378024339675903];
     
