@@ -96,12 +96,12 @@ pub struct FMDemod {
     maxphase:   f32,
     slack:      f32,
     audiodecim: usize,
-    sq:         usize,
-    devsqlimit: usize,
+    pub sq:         isize,
+    devsqlimit: isize,
 }
 
 impl FMDemod {
-    pub fn new(sps: f64, decim: usize, offset: f64, bw: f32, taps: Vec<f32>, devsqlimit: usize) -> FMDemod {
+    pub fn new(sps: f64, decim: usize, offset: f64, bw: f32, taps: Vec<f32>, devsqlimit: isize) -> FMDemod {
         let ifs = buildsine(offset, sps, 5.0).unwrap();
         
         let mut tapvi: Vec<f32> = Vec::new();
@@ -211,13 +211,13 @@ impl FMDemod {
                 if r.abs() < self.maxphase {
                     self.rsum += r;
                     self.sq -= 1;
-                    if self.sq < 1 {
-                        self.sq = 1;
+                    if self.sq < -self.devsqlimit {
+                        self.sq = -30;
                     }
                 } else {
                     self.sq += 1;
-                    if self.sq > 10 {
-                        self.sq = 30;
+                    if self.sq > self.devsqlimit {
+                        self.sq = 3;
                     }
                 }
                 
@@ -232,9 +232,9 @@ impl FMDemod {
                     self.curslack += self.slack;
                     
                     self.rsum /= self.audiodecim as f32;
-                    if self.sq > self.devsqlimit {
+                    if self.sq > 0 {
                         buf.push(0.0);
-                    } else {      
+                    } else {
                         buf.push(self.rsum / (self.sq as f32));
                     }
                     

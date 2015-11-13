@@ -3,6 +3,8 @@ name = "rsutil"
 version = "0.1.0"
 authors = ["Leonard Kevin McGuire Jr. <kmcg3413@gmail.com>"]
 
+[lib]
+
 [dependencies.lodepng]
 git = "https://github.com/pornel/lodepng-rust.git"
 [dependencies.num]

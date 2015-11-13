@@ -24,24 +24,26 @@ use std::str::FromStr;
 use std::thread;
 use std::sync::{Arc, Mutex};
 
-mod usrp;
-mod algos;
-mod dsp;
+pub mod usrp;
+pub mod algos;
+pub mod dsp;
 
-use algos::SignalMap;
-use algos::mcguire_smde;
+pub use algos::SignalMap;
+pub use algos::mcguire_smde;
 
-use dsp::Complex;
-use dsp::FMDemod;
-use dsp::wavei8write;
-use dsp::FileSource;
+pub use dsp::Complex;
+pub use dsp::FMDemod;
+pub use dsp::wavei8write;
+pub use dsp::FileSource;
 
-use usrp::USRPSource;
+pub use usrp::USRPSource;
 
 fn main() {        
     let taps: Vec<f32> = vec![0.44378024339675903f32, 0.9566655158996582, 1.4999324083328247, 2.0293939113616943, 2.499887466430664, 2.8699963092803955, 3.106461763381958, 3.1877646446228027, 3.106461763381958, 2.8699963092803955, 2.499887466430664, 2.0293939113616943, 1.4999324083328247, 0.9566655158996582, 0.44378024339675903];
+
+    let sps = 4000000.0;    
     
-    let mut fmdemod0 = FMDemod::new(4000000.0, 10, -450000.0, 15000.0, taps, 3);
+    let mut fmdemod0 = FMDemod::new(sps, 10, -840000.0, 15000.0, taps, 3);
 
     println!("processing");
     
@@ -49,7 +51,7 @@ fn main() {
     
     let mut alsa = dsp::Alsa::new(16000);
 
-    let mut ausrp = USRPSource::new(4000000.0, 146000000.0, 10.0);
+    let mut ausrp = USRPSource::new(sps, 146000000.0, 70.0);
     let mut usrp = ausrp.lock().unwrap();
     //let mut usrp = FileSource::new(String::from_str("/home/kmcguire/Projects/radiowork/usbstore/recording01").unwrap());   
     
@@ -59,11 +61,17 @@ fn main() {
 
     let mut sum: Complex<f32> = Complex { i: 0.0, q: 0.0 };    
     let mut sumcnt = 0usize;
+
+    let mut dead: isize = 0;
     
-    let gst = time::precise_time_ns();
+    let mut skip: usize = 0;
+    
+    let gst = time::precise_time_ns() as f64 / 1000.0 / 1000.0 / 1000.0;
     //while buf.len() < 16000 * 15 {
     loop {
         let mut ibuf = usrp.recv();
+        
+        /*
         for x in 0..ibuf.len() {
             sum.i += ibuf[x].i;
             sum.q += ibuf[x].q;
@@ -80,26 +88,53 @@ fn main() {
             ibuf[x].i = ibuf[x].i - sum.i / sumcnt as f32;
             ibuf[x].q = ibuf[x].q - sum.q / sumcnt as f32;
         }
+        */
         
         total_samps += ibuf.len();
         //println!("decoding block");
-        let st = time::precise_time_ns();
+        let st = time::precise_time_ns() as f64 / 1000.0 / 1000.0 / 1000.0;
         let mut out = fmdemod0.work(&ibuf);
-
+        
         //println!("out.len:{}", out.len());   
+        
+        for x in 0..out.len() {
+            if out[x].abs() > 0.0 {
+                dead -= 1;
+            } else {
+                dead += 1;
+            }
+            
+            if dead < -30 {
+                dead = -30;
+            }
+            
+            if dead > 30 {
+                dead = 30;
+            }
+            
+            if dead < 0 {
+                buf.push(out[x]);     
+            } else {
+                if buf.len() / 16000 > 2 {
+                    println!("saved {}", buf.len() / 16000);
+                    wavei8write(format!("rec_{}.wav", (st - gst).floor()), 16000, &buf);
+                }
+                buf.clear();
+            }
+        }        
 
+        /*
         for x in 0..out.len() {
             std::io::stderr().write_f32::<LittleEndian>(out[x] * 12.5);
-        }        
+        } 
+        */       
+        
+        if total_samps > 4000000 * 2 {
+            total_samps = 0;
+            println!("seq:{}", fmdemod0.sq);
+        }
         
         //println!("done {}", (time::precise_time_ns() - st) as f64 / 1000.0 / 1000.0 / 1000.0);
-        //buf.append(&mut out);
-        
-        //if buf.len() > 4000 {
-        //    alsa.write(&buf);
-        //    buf.clear();
-        //}
-        
         //println!("wavbuf:{}", buf.len());
         //println!("total_samps:{} time:{}", total_samps, st as f64 / 1000.0 / 1000.0 / 1000.0);
     }
