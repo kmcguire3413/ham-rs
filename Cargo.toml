@@ -1,6 +1,6 @@
 [package]
-name = "rsutil"
-version = "0.1.0"
+name = "ham"
+version = "0.3.48"
 authors = ["Leonard Kevin McGuire Jr. <kmcg3413@gmail.com>"]
 
 [lib]
