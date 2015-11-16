@@ -38,81 +38,155 @@ pub use dsp::FileSource;
 
 pub use usrp::USRPSource;
 
-pub fn router(rtrans: Arc<Mutex<Vec<Vec<f32>>>>) {        
+pub struct Transmission {
+    pub freq:       f64,
+    pub buf:        Vec<f32>,
+}
+
+pub struct MonitorSpec {
+    pub freq:       f64,
+}
+
+/// Internally used monitor structure.
+struct Monitor {
+    freq:       f64,
+    offset:     f64,
+    demod:      FMDemod,
+    buf:        Vec<f32>,
+    dead:       isize,
+}
+
+pub fn router(rtrans: Arc<Mutex<Vec<Transmission>>>, targets: Vec<MonitorSpec>) {        
     println!("[ham-router] initializing");
+    
+    // Let us determine the actual spread of these frequencies so we know
+    // we sample rate we need to run at in order to capture them.
+    let mut target_min = std::f64::MAX;
+    let mut target_max = std::f64::MIN;
+    for x in 0..targets.len() {
+        if targets[x].freq > target_max {
+            target_max = targets[x].freq;
+        }
+        
+        if targets[x].freq < target_min {
+            target_min = targets[x].freq;
+        }
+    }
+    
+    // Add 100khz on both sides just to be safe, and this will
+    // be our sample rate.
+    //let sps = (target_max - target_min) + 100000.0 * 2.0;
+    let sps = 4000000f64;
+
+    // Set our center frequency in the middle of the spread.
+    let freq_center = target_min + (target_max - target_min) * 0.5;
+    
+    println!("[ham-router] setting center frequency to {}", freq_center);
+    println!("[ham-router] setting sample rate to {}", sps);
+    
+    // This forms a nice filter for 15khz FM.
     let taps: Vec<f32> = vec![0.44378024339675903f32, 0.9566655158996582, 1.4999324083328247, 2.0293939113616943, 2.499887466430664, 2.8699963092803955, 3.106461763381958, 3.1877646446228027, 3.106461763381958, 2.8699963092803955, 2.499887466430664, 2.0293939113616943, 1.4999324083328247, 0.9566655158996582, 0.44378024339675903];
 
-    let sps = 4000000.0;    
-    
-    let mut fmdemod0 = FMDemod::new(sps, 10, -440000.0, 15000.0, taps, 3);
-    
-    let mut buf: Vec<f32> = Vec::new();
-    
-    let mut alsa = dsp::Alsa::new(16000);
+    let mut monitors: Vec<Monitor> = Vec::new();
 
-    let mut ausrp = USRPSource::new(sps, 146000000.0, 70.0);
+    for x in 0..targets.len() {
+        monitors.push(Monitor {
+            freq:       targets[x].freq,
+            offset:     freq_center - targets[x].freq,
+            demod:      FMDemod::new(sps, 10, freq_center - targets[x].freq, 15000.0, taps.clone(), 3),
+            buf:        Vec::new(),  
+            dead:       1,
+        });
+    }
+
+    //     
+    //let mut fmdemod0 = FMDemod::new(sps, 10, -440000.0, 15000.0, taps, 3);
+    
+    //let mut buf: Vec<f32> = Vec::new();
+    
+    //let mut alsa = dsp::Alsa::new(16000);
+
+    // At the moment the gain is locked at 70dB since my setup is currently
+    // using a very low gain antenna. However, in the future I can look at
+    // auto adjusting the gain lower if it causes over-saturation.
+    let mut ausrp = USRPSource::new(sps, freq_center, 70.0);
     let mut usrp = ausrp.lock().unwrap();
+    
+    // A debugging source that mimics the USRP as a source.    
     //let mut usrp = FileSource::new(String::from_str("/home/kmcguire/Projects/radiowork/usbstore/recording01").unwrap());   
     
+    // This just keeps an instrumental tracking of the number of samples
+    // that have been processed.
     let mut total_samps = 0;
-
-    let mut sum: Complex<f32> = Complex { i: 0.0, q: 0.0 };    
-    let mut sumcnt = 0usize;
-
-    let mut dead: isize = 0;
-    
-    let mut skip: usize = 0;
-    
+            
     let gst = time::precise_time_ns() as f64 / 1000.0 / 1000.0 / 1000.0;
     
-    println!("[ham-router] listening to broadband signal");
+    println!("[ham-router] capturing broadband signal..");
 
     loop {
         let mut ibuf = usrp.recv();
                 
         total_samps += ibuf.len();
+
         let st = time::precise_time_ns() as f64 / 1000.0 / 1000.0 / 1000.0;
-        let mut out = fmdemod0.work(&ibuf);   
+
+        for mon in monitors.iter_mut() {        
         
-        for x in 0..out.len() {
-            if out[x].abs() > 0.0 {
-                dead -= 1;
-            } else {
-                dead += 1;
-            }
-            
-            if dead < -30 {
-                dead = -30;
-            }
-            
-            if dead > 30 {
-                dead = 30;
-            }
-            
-            if dead < 0 {
-                buf.push(out[x]);     
-            } else {
-                if buf.len() / 16000 > 2 {
-                    //println!("saved {}", buf.len() / 16000);
-                    //wavei8write(format!("rec_{}.wav", (st - gst).floor()), 16000, &buf);
-                    
-                    // Place the transmission into the output buffer. The locking
-                    // provides the synchronization to support an external thread
-                    // accessing the buffer concurrently.
-                    println!("[ham-router] placed transmission of {} seconds into output buffer", buf.len() as f32 / 16000.0);
-                    let mut out = rtrans.lock().unwrap();
-                    out.push(buf);
-                    
-                    buf = Vec::new();
+            let mut out = mon.demod.work(&ibuf);
+
+            if total_samps > 4000000 {            
+                //println!("freq:{} sq:{} dead:{}", mon.freq, mon.demod.sq, mon.dead);
+            }   
+        
+            for x in 0..out.len() {
+                if out[x].abs() > 0.0 {
+                    mon.dead -= 1;
                 } else {
-                    buf.clear();
+                    mon.dead += 1;
                 }
-            }
-        }        
-        
-        if total_samps > 4000000 * 2 {
+            
+                if mon.dead < -30 {
+                    mon.dead = -30;
+                }
+                
+                if mon.dead > 30 {
+                    mon.dead = 30;
+                }
+                
+                // If we have activity then start pushing the audio output
+                // samples into our monitor buffer. Once we see no activity
+                // then evaluate if it contains enough to be considered a
+                // transmission and if so then place it into the output queue
+                // and prepare for the next transmission.
+                if mon.dead < 0 {
+                    mon.buf.push(out[x]);     
+                } else {
+                    if mon.buf.len() / 16000 > 2 {
+                        // Place the transmission into the output buffer. The locking
+                        // provides the synchronization to support an external thread
+                        // accessing the buffer concurrently.
+                        println!("[ham-router] placed transmission of {} seconds into output buffer", mon.buf.len() as f32 / 16000.0);
+                        let mut tout = rtrans.lock().unwrap();
+
+                        // Since we have ownership rules and rules that keep something from
+                        // being uninitialized we must create a fresh buffer and swap it out
+                        // with the buffer that we wish to put into the queue.
+                        let mut tmpbuf: Vec<f32> = Vec::new();
+                        std::mem::swap(&mut tmpbuf, &mut mon.buf);                        
+                        
+                        tout.push(Transmission {
+                            freq:       mon.freq,
+                            buf:        tmpbuf,
+                        });
+                    } else {
+                        mon.buf.clear();
+                    }
+                }
+            }        
+        }
+                
+        if total_samps > 4000000 {
             total_samps = 0;
-            println!("seq:{}", fmdemod0.sq);
         }
         
         //println!("done {}", (time::precise_time_ns() - st) as f64 / 1000.0 / 1000.0 / 1000.0);
