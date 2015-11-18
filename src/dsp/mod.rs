@@ -46,6 +46,11 @@ impl Alsa {
 }
 
 pub fn buildsine(freq: f64, sps: f64, amp: f32) -> Option<Vec<Complex<f32>>> {
+    // Do not build if too low in frequency.
+    if freq.abs() < 500.0 {
+        return Option::Some(vec![Complex { i: 1.0, q: 0.0 } ]);
+    }
+
     if freq * 4.0 > sps {
         return Option::None;
     }
@@ -54,18 +59,33 @@ pub fn buildsine(freq: f64, sps: f64, amp: f32) -> Option<Vec<Complex<f32>>> {
     // by a sample do we need for a full cycle of the
     // frequency.
     let timepersample = 1.0f64 / sps as f64;
-    let units = ((1.0 / freq).abs() / timepersample).ceil() as usize;
+    let units = ((1.0 / freq).abs() / timepersample).abs();
     
-    println!("timepersample:{} freqfullwave:{}", 
-        timepersample,
-        1.0 / freq
-    );
+    //println!("timepersample:{} freqfullwave:{}", 
+    //    timepersample,
+    //    1.0 / freq
+    //);
+    
+    // Try to find a multiple of units that is as close as possible
+    // to a whole integer number of units.
+    let mut low_diff = std::f64::MAX;
+    let mut low_mul = 0usize;
+    for x in 1..100000 {
+        let m = units * x as f64;
+        let diff = m - m.floor();
+        if diff < low_diff {
+            low_diff = diff;
+            low_mul = x;
+        }
+    }
+    
+    let iunits = (units * low_mul as f64).floor() as usize;
+    
+    println!("pre-built cosine for freq({}) with units({}) and diff({})", freq, units, low_diff);
     
     let mut out: Vec<Complex<f32>> = Vec::new();
-
-    println!("units:{}", units);
     
-    for x in 0..units * 100 {
+    for x in 0..iunits {
         let curtime = (x as f64) * timepersample;
         out.push(Complex {
             i:  (curtime * freq * std::f64::consts::PI * 2.0).cos() as f32 * amp,
@@ -96,13 +116,14 @@ pub struct FMDemod {
     maxphase:   f32,
     slack:      f32,
     audiodecim: usize,
-    pub sq:         isize,
+    pub sq:     isize,
     devsqlimit: isize,
+    sindex:     f64,
 }
 
 impl FMDemod {
     pub fn new(sps: f64, decim: usize, offset: f64, bw: f32, taps: Vec<f32>, devsqlimit: isize) -> FMDemod {
-        let ifs = buildsine(offset, sps, 5.0).unwrap();
+        let ifs = buildsine(offset, sps, 1.0).unwrap();
         
         let mut tapvi: Vec<f32> = Vec::new();
         let mut tapvq: Vec<f32> = Vec::new();
@@ -147,14 +168,25 @@ impl FMDemod {
     	   decim:      decim,
     	   curslack:   0.0,
     	   sq:         0,
+    	   sindex:     0.0,
     	}
     }
     
     pub fn work(&mut self, stream: &Vec<Complex<f32>>) -> Vec<f32> {
         let mut buf: Vec<f32> = Vec::with_capacity(stream.len() / self.decim / self.audiodecim); 
+
+        let timepersample = 1.0f64 / self.sps as f64;
+        
+        let mut lr: f32 = 0.0;
             
         for x in 0..stream.len() {
-            let mut s = stream[x].clone();            
+            let mut s = stream[x].clone();
+            
+            //let ifc = Complex {
+            //    i:      (timepersample * self.sindex * self.offset * std::f64::consts::PI * 2.0).cos() as f32,
+            //    q:      (timepersample * self.sindex * self.offset * std::f64::consts::PI * 2.0).sin() as f32,
+            //};            
+            //self.sindex += 1.0;
                         
             s.mul(&self.ifs[self.ifsndx]);
             
@@ -203,20 +235,26 @@ impl FMDemod {
                 r = a - b;
                 
                 if r > std::f32::consts::PI {
+                    r = std::f32::consts::PI * 2.0 - r;
+                }
+                
+                if r < -std::f32::consts::PI {
                     r = std::f32::consts::PI * 2.0 + r;
-                }                
+                }
                                 
                 // This limits sharp impulses where spikes have slipped
                 // through our taps filter.
                 if r.abs() < self.maxphase {
                     self.rsum += r;
+                    lr = r;
                     self.sq -= 1;
-                    if self.sq < -self.devsqlimit {
-                        self.sq = -30;
+                    if self.sq < -300 {
+                        self.sq = -300;
                     }
                 } else {
+                    //self.rsum += lr;
                     self.sq += 1;
-                    if self.sq > self.devsqlimit {
+                    if self.sq > 3 {
                         self.sq = 3;
                     }
                 }
@@ -235,7 +273,7 @@ impl FMDemod {
                     if self.sq > 0 {
                         buf.push(0.0);
                     } else {
-                        buf.push(self.rsum / (self.sq as f32));
+                        buf.push(self.rsum);
                     }
                     
                     self.rsum = 0f32;                    

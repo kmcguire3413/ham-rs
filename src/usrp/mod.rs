@@ -132,6 +132,21 @@ impl USRPSource {
         ausrp
     }
     
+    pub fn set_rx_gain(&mut self, gain: f64) {
+        //     pub fn uhd_usrp_set_rx_gain(h: uhd_usrp_handle, gain: ::libc::c_double,
+        //                     chan: size_t,
+        //                      gain_name: *const ::libc::c_char)
+        // -> uhd_error;
+        
+        // A safe-guard.
+        if gain > 70.0 {
+            return;
+        }
+        unsafe {
+            sys::uhd_usrp_set_rx_gain(self.usrp_handle, gain, self.channel, 0 as *const ::libc::c_char);
+        }
+    }
+    
     pub fn recv(&mut self) -> Vec<Complex<f32>> {
         unsafe {
             let mut err: libc::c_uint;

@@ -75,8 +75,12 @@ pub fn router(rtrans: Arc<Mutex<Vec<Transmission>>>, targets: Vec<MonitorSpec>) 
     
     // Add 100khz on both sides just to be safe, and this will
     // be our sample rate.
-    //let sps = (target_max - target_min) + 100000.0 * 2.0;
-    let sps = 4000000f64;
+    let mut sps = (target_max - target_min) + 200000.0 * 2.0;
+    
+    if sps < 4000000.0 {
+        sps = 4000000.0;
+    }
+    
 
     // Set our center frequency in the middle of the spread.
     let freq_center = target_min + (target_max - target_min) * 0.5;
@@ -89,11 +93,16 @@ pub fn router(rtrans: Arc<Mutex<Vec<Transmission>>>, targets: Vec<MonitorSpec>) 
 
     let mut monitors: Vec<Monitor> = Vec::new();
 
+    let decim = (sps / 400000.0).floor() as usize;
+    
+    println!("decim set to {}", decim);   
+    
     for x in 0..targets.len() {
+        println!("offset:{} frequency:{}", freq_center - targets[x].freq, targets[x].freq);
         monitors.push(Monitor {
             freq:       targets[x].freq,
             offset:     freq_center - targets[x].freq,
-            demod:      FMDemod::new(sps, 10, freq_center - targets[x].freq, 15000.0, taps.clone(), 3),
+            demod:      FMDemod::new(sps, decim, freq_center - targets[x].freq, 15000.0, taps.clone(), 3),
             buf:        Vec::new(),  
             dead:       1,
         });
@@ -109,7 +118,7 @@ pub fn router(rtrans: Arc<Mutex<Vec<Transmission>>>, targets: Vec<MonitorSpec>) 
     // At the moment the gain is locked at 70dB since my setup is currently
     // using a very low gain antenna. However, in the future I can look at
     // auto adjusting the gain lower if it causes over-saturation.
-    let mut ausrp = USRPSource::new(sps, freq_center, 70.0);
+    let mut ausrp = USRPSource::new(sps, freq_center, 1.0);
     let mut usrp = ausrp.lock().unwrap();
     
     // A debugging source that mimics the USRP as a source.    
@@ -123,8 +132,42 @@ pub fn router(rtrans: Arc<Mutex<Vec<Transmission>>>, targets: Vec<MonitorSpec>) 
     
     println!("[ham-router] capturing broadband signal..");
 
+    let mut avgpwr = 0f64;
+    let mut avgcnt = 0usize;
+    let mut curgain = 1.0f64;
+    let mut maxgain = 50.0f64;
+
     loop {
         let mut ibuf = usrp.recv();
+        
+        // Try to establish AGC.
+        for x in 0..ibuf.len() {
+            let spwr = (ibuf[x].i * ibuf[x].i + ibuf[x].q * ibuf[x].q).sqrt();
+            avgpwr += spwr as f64;
+            avgcnt += 1;
+        }
+        
+        if avgcnt > 500000 {
+            avgpwr = avgpwr / avgcnt as f64;
+            if avgpwr > 0.20 {
+                curgain -= 1.0;
+                if curgain < 1.0 {
+                    curgain = 1.0;
+                }
+                usrp.set_rx_gain(curgain);
+                println!("gain decreased to {} with avg pwr {}", curgain, avgpwr);
+            }
+            if avgpwr < 0.03 {
+                curgain += 1.0;
+                if curgain > maxgain {
+                    curgain = maxgain;
+                }
+                usrp.set_rx_gain(curgain);
+                println!("gain increased to {} with avg pwr {}", curgain, avgpwr);
+            }
+            avgcnt = 0;
+            avgpwr = 0.0;
+        }
                 
         total_samps += ibuf.len();
 
@@ -135,7 +178,7 @@ pub fn router(rtrans: Arc<Mutex<Vec<Transmission>>>, targets: Vec<MonitorSpec>) 
             let mut out = mon.demod.work(&ibuf);
 
             if total_samps > 4000000 {            
-                //println!("freq:{} sq:{} dead:{}", mon.freq, mon.demod.sq, mon.dead);
+                println!("freq:{} sq:{} dead:{}", mon.freq, mon.demod.sq, mon.dead);
             }   
         
             for x in 0..out.len() {
@@ -145,8 +188,8 @@ pub fn router(rtrans: Arc<Mutex<Vec<Transmission>>>, targets: Vec<MonitorSpec>) 
                     mon.dead += 1;
                 }
             
-                if mon.dead < -30 {
-                    mon.dead = -30;
+                if mon.dead < -8000 {
+                    mon.dead = -8000;
                 }
                 
                 if mon.dead > 30 {
