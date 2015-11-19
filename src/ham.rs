@@ -56,6 +56,266 @@ struct Monitor {
     dead:       isize,
 }
 
+
+trait Block {
+    fn work(&mut self, xin: &Vec<Complex<f32>>);
+}
+
+#[test]
+fn test_server() {
+    let th = thread::spawn(move || {
+        use muds::block::net::ControlInfo;
+        use std::sync::mpsc::{channel, Receiver, Sender};
+    
+        let server = muds::block::net::Server::new("0.0.0.0:1055").unwrap();
+        
+        let (tx, rx) = channel::<(u64, u8, u64, u8)>();
+        
+        println!("server started");
+        loop {
+            println!("waiting on message from server");
+            match server.read().unwrap() {
+                ControlInfo::ClientHello { luid, client } => {
+                    println!("client hello {}", luid);
+                    tx.send((luid, 0, 0, 0));
+                },
+                ControlInfo::ClientBye { luid, client } => {
+                    println!("client byte {}", luid);
+                    tx.send((luid, 1, 0, 0));
+                },
+                ControlInfo::ClientData { luid, client } => {
+                    println!("client data {}", luid);
+                    let buf = client.read().unwrap();
+                    let chk: u8 = 0;
+                    for x in 0..buf.len() {
+                        chk = chk ^ buf[x];
+                    }
+                    tx.send((luid, 2, buf.len(), chk));
+                },
+                ControlInfo::ClientFull { luid, client } => {
+                    println!("client full {}", luid);
+                    tx.send((luid, 3, 0, 0));
+                }
+            }
+        }
+    });
+    
+    
+    
+    th.join();
+}
+
+pub mod muds {
+    pub mod block {
+        pub mod net {
+            use std::sync::{Arc, Mutex, Condvar};
+            use std::net::{TcpListener, TcpStream};
+            use std::thread;      
+            use std::collections::{VecDeque, HashMap};
+            use std::sync::mpsc::{Sender, Receiver, channel, RecvError};
+            use std;
+            
+            use std::io::{Read, Write};
+            
+            pub struct Client {
+                stream:      TcpStream,
+                luid:        u64,
+                buffer:      VecDeque<Vec<u8>>,
+                ctrltx:      Sender<ControlInfo>,
+                waitsz:      usize,
+                waitlimit:   usize,
+                fullsignal:  Arc<(Mutex<bool>, Condvar)>,
+            }
+            
+            impl Client {
+                pub fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.stream.write(buf)
+                }
+                pub fn read(&mut self) -> Option<Vec<u8>> {
+                    let mut mustnotify = false;
+                    if self.buffer.len() >= self.waitlimit {
+                        mustnotify = true;
+                    }
+                    match self.buffer.pop_front() {
+                        Option::Some(v) => {
+                            self.waitsz -= v.len();
+                            if mustnotify {
+                                // Obviously, the wait is happening now or is 
+                                // about to happen.
+                                {
+                                    let mut started = self.fullsignal.0.lock().unwrap();
+                                    *started = true;
+                                }
+                                self.fullsignal.1.notify_one();                            
+                            }
+                            Option::Some(v)
+                        },
+                        Option::None => Option::None,
+                    }
+                }
+                pub fn get_luid(&self) -> u64 {
+                    self.luid
+                }
+                pub fn can_read(&self) -> bool {
+                    self.buffer.len() > 0
+                }
+            }
+            
+            pub enum ControlInfo {
+                ClientHello { luid: u64, client: Arc<Mutex<Client>> },
+                ClientBye { luid: u64, client: Arc<Mutex<Client>> },
+                ClientData { luid: u64, client: Arc<Mutex<Client>> },
+                ClientFull { luid: u64, client: Arc<Mutex<Client>> },
+            }
+        
+            pub struct Server {
+                strms:      Arc<Mutex<HashMap<u64, Arc<Mutex<Client>>>>>,
+                ctrlrx:     Receiver<ControlInfo>,
+            }
+            
+            impl Server {
+                pub fn write(&self, luid: u64, buf: &[u8]) -> std::io::Result<usize> {
+                    let strms = self.strms.lock().unwrap();
+                    let mut lck = strms.get(&luid).unwrap().lock().unwrap();
+                    lck.write(buf)
+                }
+                
+                pub fn read(&self) -> Result<ControlInfo, RecvError> {
+                    self.ctrlrx.recv()
+                }        
+            
+                pub fn new(addr: &str) -> Option<Server>  {                    
+                    let srv = TcpListener::bind(addr);
+                    
+                    // TODO: add method to shutdown this server.. maybe using
+                    //       a client whom connections with a special message
+                    match srv {
+                        Result::Ok(srv) => {
+                            let strms: Arc<Mutex<HashMap<u64, Arc<Mutex<Client>>>>> = Arc::new(Mutex::new(HashMap::new()));
+                            let strms_clone = strms.clone();
+                            let (ctrltx, ctrlrx) = channel::<ControlInfo>();                        
+                            thread::spawn(move || {
+                                let mut luid: u64 = 100;
+                                for stream in srv.incoming() {
+                                    match stream {
+                                        Result::Ok(stream) => {
+                                            luid += 1;
+                                            stream.set_read_timeout(Option::None);
+                                            stream.set_write_timeout(Option::None);
+                                            let mut stream_clone = stream.try_clone().unwrap();
+                                            let client = Arc::new(Mutex::new(Client {
+                                                stream:     stream,
+                                                luid:       luid,
+                                                buffer:     VecDeque::new(),
+                                                ctrltx:     ctrltx.clone(),   
+                                                waitsz:    0,
+                                                waitlimit:  1024 * 1024 * 16,
+                                                fullsignal: Arc::new((Mutex::new(false), Condvar::new())),                                                                                          
+                                            }));
+                                            let ctrltx_clone = ctrltx.clone();
+                                            let client_clone = client.clone();
+                                            let mut lck = strms.lock().unwrap();
+                                            lck.insert(luid, client);
+                                            ctrltx.send(ControlInfo::ClientHello { luid: luid, client: client_clone.clone() });
+                                            thread::spawn(move || {
+                                                let bufsz = 2048;
+                                                let mut buf: Vec<u8>;
+                                                loop {
+                                                    buf = Vec::with_capacity(bufsz);
+                                                    unsafe {
+                                                        buf.set_len(bufsz);
+                                                    }                                                
+                                                    let rsz = match stream_clone.read(buf.as_mut_slice()) {
+                                                        Result::Ok(v) => v,
+                                                        Result::Err(_) => {
+                                                            // Terminate this reader thread.
+                                                            ctrltx_clone.send(ControlInfo::ClientBye { luid: luid, client: client_clone.clone() });
+                                                            return;
+                                                        },
+                                                    };
+                                                    
+                                                    println!("DATA!!!");                          
+                                                    
+                                                    if rsz < 1 {
+                                                        continue;
+                                                    }
+                                                    unsafe {
+                                                        buf.set_len(rsz);
+                                                    }
+                                                    
+                                                    let mut fullsignal: Option<Arc<(Mutex<bool>, Condvar)>> = Option::None;
+                                                    {
+                                                        // Only lock long enough to put data into
+                                                        // the buffer.
+                                                        let mut lck = client_clone.lock().unwrap();
+                                                        if lck.waitsz < lck.waitlimit {
+                                                            lck.waitsz += buf.len();
+                                                            lck.buffer.push_back(buf);
+                                                            if lck.buffer.len() == 1 {
+                                                                lck.ctrltx.send(ControlInfo::ClientData { luid: luid, client: client_clone.clone() });
+                                                            }
+                                                            if lck.waitsz >= lck.waitlimit {
+                                                                // Get setup to stop reading from the socket.
+                                                                lck.ctrltx.send(ControlInfo::ClientFull { luid: luid, client: client_clone.clone() });
+                                                                fullsignal = Option::Some(lck.fullsignal.clone());    
+                                                            }
+                                                        } 
+                                                    }
+                                                    
+                                                    // The point here is to stop reading from the socket which will
+                                                    // cause the TCP stream receive window to decrease to zero if needed
+                                                    // until we can resume reading from the socket. This is needed to
+                                                    // prevent the remote end from exhausting our memory. We can not simply
+                                                    // spin here and eat CPU either so we need to block for a signal. If by
+                                                    // the time we wake the socket is dead then we shall know gracefully and
+                                                    // exit gracefully up above this point in the loop.
+                                                    match fullsignal {
+                                                        Option::Some(fullsignal) => {
+                                                            let mut started = fullsignal.0.lock().unwrap();
+                                                            while !*started {
+                                                                started = fullsignal.1.wait(started).unwrap();
+                                                            }
+                                                        },
+                                                        Option::None => (),
+                                                    }
+                                                }
+                                            });
+                                        },
+                                        Result::Err(err) => (),
+                                    }
+                                }
+                            });
+                            Option::Some(Server {
+                                strms:      strms_clone,
+                                ctrlrx:     ctrlrx,
+                            })
+                        },
+                        Result::Err(err) => Option::None,                   
+                    }
+                } 
+            }
+        }
+        mod directory {
+            pub fn net() {
+                
+            }
+            
+            pub fn sys() {
+            }
+            
+            pub fn link_to(sysid: Vec<u8>, compid: Vec<u8>, portid: Vec<u8>) {
+            }
+            
+            pub fn link_from(compid: Vec<u8>, portid: Vec<u8>) {
+            }
+        }
+        
+        pub fn usrp() {            
+        }
+    }
+}
+
+
 pub fn router(rtrans: Arc<Mutex<Vec<Transmission>>>, targets: Vec<MonitorSpec>) {        
     println!("[ham-router] initializing");
     
